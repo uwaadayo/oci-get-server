@@ -16,10 +16,8 @@ jobs:
         run: |
           pip install oci-cli
           mkdir -p ~/.oci
-          # 秘密鍵を書き出し
           echo "${{ secrets.OCI_CONFIG_KEY }}" > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
-          # 設定ファイル作成
           echo "[DEFAULT]" > ~/.oci/config
           echo "user=${{ secrets.OCI_CONFIG_USER }}" >> ~/.oci/config
           echo "fingerprint=${{ secrets.OCI_CONFIG_FINGERPRINT }}" >> ~/.oci/config
@@ -32,7 +30,6 @@ jobs:
           set +e
           export TZ=Asia/Tokyo
           
-          # シェイプとADのリスト
           SHAPES=("VM.Standard.A1.Flex" "VM.Standard.E4.Flex")
           ADS=("Uocm:AP-TOKYO-1-AD-1" "Uocm:AP-TOKYO-1-AD-2" "Uocm:AP-TOKYO-1-AD-3")
           STACK_ID="${{ secrets.OCI_CONFIG_STACK_ID }}"
@@ -48,12 +45,59 @@ jobs:
 
             echo "[$TIMESTAMP] Start: $CURRENT_SHAPE in $CURRENT_AD"
 
-            # 修正箇所：変数をJSON形式で渡すように変更
-            # Terraformの変数名（instance_shape, availability_domain）に合わせています
-            VARIABLES_JSON="{\"instance_shape\": \"$CURRENT_SHAPE\", \"availability_domain\": \"$CURRENT_AD\"}"
+            # 修正：JSONの引用符トラブルを避けるため、ファイル経由で渡す
+            echo "{\"instance_shape\": \"$CURRENT_SHAPE\", \"availability_domain\": \"$CURRENT_AD\"}" > params.json
 
-            # コマンド実行（自動承認モードを追加）
             RESPONSE=$(oci resource-manager job create-apply-job \
               --stack-id "$STACK_ID" \
               --execution-plan-strategy "AUTO_APPROVED" \
-              --variables "$VARIABLES_JSON" 2>&1)
+              --variables file://params.json 2>&1)
+            
+            EXIT_CODE=$?
+
+            if [ $EXIT_CODE -eq 0 ]; then
+              JOB_ID=$(echo "$RESPONSE" | jq -r '.data.id // empty' 2>/dev/null)
+              if [ ! -z "$JOB_ID" ]; then
+                 echo "[$TIMESTAMP] SUCCESS: Instance provisioned (Job ID: $JOB_ID)"; exit 0
+              fi
+            fi
+
+            STATUS=$(echo "$RESPONSE" | grep -o "ServiceError" || echo "")
+            
+            if [[ "$RESPONSE" == *"401"* ]] || [[ "$RESPONSE" == *"403"* ]]; then
+               echo "[$TIMESTAMP] ERROR: Auth issue details below:"
+               echo "$RESPONSE"
+               exit 1
+            fi
+
+            if [[ "$RESPONSE" == *"Out of host capacity"* ]] || [[ "$RESPONSE" == *"LimitExceeded"* ]]; then
+               CODE="OutOfCapacity"
+            elif [[ "$RESPONSE" == *"TooManyRequests"* ]] || [[ "$RESPONSE" == *"429"* ]]; then
+               CODE="RateLimit"
+            elif [[ "$RESPONSE" == *"IncorrectState"* ]]; then
+               CODE="IncorrectState"
+            else
+               CODE="UnknownError"
+               SHORT_ERR=$(echo "$RESPONSE" | head -n 3)
+            fi
+            
+            LOG_REPORT="${LOG_REPORT}  - ${CURRENT_SHAPE} / ${CURRENT_AD} : ${CODE} : ${SHORT_ERR}\n"
+
+            case "$CODE" in
+              RateLimit) echo "[$TIMESTAMP] HALT: Rate limited."; break ;;
+              OutOfCapacity) ad_idx=$((ad_idx + 1)); retry_count=0 ;;
+              IncorrectState|UnknownError)
+                retry_count=$((retry_count + 1))
+                if [ $retry_count -gt $MAX_RETRY ]; then ad_idx=$((ad_idx + 1)); retry_count=0
+                else echo "[$TIMESTAMP] RETRY: Wait 30s..."; sleep 30; continue; fi ;;
+              *) echo "[$TIMESTAMP] HALT: Fatal error."; break ;;
+            esac
+
+            if [ $ad_idx -ge ${#ADS[@]} ]; then ad_idx=0; shape_idx=$((shape_idx + 1)); fi
+            if [ $shape_idx -ge ${#SHAPES[@]} ]; then break; fi
+          done
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🏁 撤退報告 (Withdrawal Report)"
+          echo -e "$LOG_REPORT"
+          echo "  - 最終到達: ${LAST_SHAPE} in ${LAST_AD}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
