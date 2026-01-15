@@ -12,14 +12,26 @@ jobs:
   request:
     runs-on: ubuntu-latest
     steps:
-      - name: Setup OCI CLI
-        uses: oracle-actions/setup-oci-cli@v1
-        with:
-          user: ${{ secrets.OCI_CONFIG_USER }}
-          fingerprint: ${{ secrets.OCI_CONFIG_FINGERPRINT }}
-          tenancy: ${{ secrets.OCI_CONFIG_TENANCY }}
-          region: ap-tokyo-1
-          api_key: ${{ secrets.OCI_CONFIG_KEY }}
+      # 修正箇所：外部アクションを使わず、手動でインストールと設定を行う
+      - name: Install and Configure OCI CLI
+        run: |
+          # 1. OCI CLI のインストール
+          pip install oci-cli
+
+          # 2. 設定ディレクトリの作成
+          mkdir -p ~/.oci
+
+          # 3. 秘密鍵ファイルの作成
+          echo "${{ secrets.OCI_CONFIG_KEY }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          # 4. configファイルの作成
+          echo "[DEFAULT]" > ~/.oci/config
+          echo "user=${{ secrets.OCI_CONFIG_USER }}" >> ~/.oci/config
+          echo "fingerprint=${{ secrets.OCI_CONFIG_FINGERPRINT }}" >> ~/.oci/config
+          echo "tenancy=${{ secrets.OCI_CONFIG_TENANCY }}" >> ~/.oci/config
+          echo "region=ap-tokyo-1" >> ~/.oci/config
+          echo "key_file=${HOME}/.oci/oci_api_key.pem" >> ~/.oci/config
 
       - name: Execute State Machine
         run: |
@@ -42,6 +54,7 @@ jobs:
             echo "[$TIMESTAMP] Start: $CURRENT_SHAPE in $CURRENT_AD (Retry: $retry_count)"
 
             set +e
+            # コマンド実行（設定ファイルはデフォルトの ~/.oci/config が使われます）
             RESPONSE=$(oci resource-manager job create-apply-job --stack-id "$STACK_ID" --availability-domain "$CURRENT_AD" --shape "$CURRENT_SHAPE" 2>&1)
             EXIT_CODE=$?
             set -e
