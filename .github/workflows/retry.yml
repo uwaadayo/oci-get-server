@@ -1,0 +1,32 @@
+name: OCI Auto Retry v5.0.3 Web Edition
+on:
+  schedule:
+    - cron: '*/15 * * * *' # 15分おきに自動実行
+  workflow_dispatch:      # 手動実行ボタン
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup OCI CLI
+        uses: oracle-actions/setup-oci-cli@v1
+        with:
+          user: ${{ secrets.OCI_CONFIG_USER }}
+          fingerprint: ${{ secrets.OCI_CONFIG_FINGERPRINT }}
+          tenancy: ${{ secrets.OCI_CONFIG_TENANCY }}
+          region: ap-tokyo-1
+          api_key: ${{ secrets.OCI_CONFIG_KEY }}
+
+      - name: Run Attack
+        run: |
+          STACK_ID="${{ secrets.OCI_STACK_ID }}"
+          for i in {1..2}; do
+            echo "[$(date)] アタック $i 回目..."
+            RESPONSE=$(oci resource-manager job create-apply-job --stack-id "$STACK_ID" --execution-plan-strategy AUTO_APPROVED 2>&1)
+            if echo "$RESPONSE" | grep -q "ocid1.ormjob"; then
+              echo "✅ ジョブ作成成功"
+            else
+              echo "❌ 失敗: $RESPONSE"
+            fi
+            if [ $i -lt 2 ]; then sleep 300; fi
+          done
