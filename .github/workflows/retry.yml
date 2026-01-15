@@ -1,78 +1,8 @@
-name: oci-instance-request-engine
+name: sanity-check
 on:
-  schedule:
-    - cron: '*/15 * * * *'
   workflow_dispatch:
-
-concurrency:
-  group: oci-auto-retry
-  cancel-in-progress: true
-
 jobs:
-  request:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: Setup OCI CLI
-        uses: oracle-actions/setup-oci-cli@v1
-        with:
-          user: ${{ secrets.OCI_CONFIG_USER }}
-          fingerprint: ${{ secrets.OCI_CONFIG_FINGERPRINT }}
-          tenancy: ${{ secrets.OCI_CONFIG_TENANCY }}
-          region: ap-tokyo-1
-          api_key: ${{ secrets.OCI_CONFIG_KEY }}
-
-      - name: Execute State Machine
-        run: |
-          set -euo pipefail
-          export TZ=Asia/Tokyo
-          
-          SHAPES=("VM.Standard.A1.Flex" "VM.Standard.E4.Flex")
-          ADS=("Uocm:AP-TOKYO-1-AD-1" "Uocm:AP-TOKYO-1-AD-2" "Uocm:AP-TOKYO-1-AD-3")
-          STACK_ID="${{ secrets.OCI_CONFIG_STACK_ID }}"
-          
-          shape_idx=0; ad_idx=0; retry_count=0; MAX_RETRY=2
-          LOG_REPORT=""; LAST_SHAPE=""; LAST_AD=""
-
-          while true; do
-            CURRENT_SHAPE="${SHAPES[$shape_idx]}"
-            CURRENT_AD="${ADS[$ad_idx]}"
-            LAST_SHAPE="$CURRENT_SHAPE"; LAST_AD="$CURRENT_AD"
-            TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
-
-            echo "[$TIMESTAMP] Start: $CURRENT_SHAPE in $CURRENT_AD (Retry: $retry_count)"
-
-            set +e
-            RESPONSE=$(oci resource-manager job create-apply-job --stack-id "$STACK_ID" --availability-domain "$CURRENT_AD" --shape "$CURRENT_SHAPE" 2>&1)
-            EXIT_CODE=$?
-            set -e
-
-            if [ $EXIT_CODE -eq 0 ]; then
-              JOB_ID=$(echo "$RESPONSE" | jq -r '.data.id // empty' 2>/dev/null)
-              echo "[$TIMESTAMP] SUCCESS: Instance provisioned (ID: $JOB_ID)"; exit 0
-            fi
-
-            STATUS=$(echo "$RESPONSE" | jq -r '.status // empty' 2>/dev/null)
-            CODE=$(echo "$RESPONSE" | jq -r '.code // empty' 2>/dev/null)
-            
-            if [ -z "$STATUS" ]; then STATUS="NON_JSON"; fi
-            LOG_REPORT="${LOG_REPORT}  - ${CURRENT_SHAPE} / ${CURRENT_AD} : ${STATUS}:${CODE}\n"
-
-            case "$STATUS:$CODE" in
-              401:*|403:*) echo "[$TIMESTAMP] ERROR: Auth issue."; exit 1 ;;
-              429:*) echo "[$TIMESTAMP] HALT: Rate limited."; break ;;
-              409:OutOfCapacity|409:LimitExceeded) ad_idx=$((ad_idx + 1)); retry_count=0 ;;
-              409:IncorrectState|5*:*|NON_JSON:*)
-                retry_count=$((retry_count + 1))
-                if [ $retry_count -gt $MAX_RETRY ]; then ad_idx=$((ad_idx + 1)); retry_count=0
-                else echo "[$TIMESTAMP] RETRY: Wait 30s..."; sleep 30; continue; fi ;;
-              409:Conflict) echo "[$TIMESTAMP] HALT: Stack Conflict."; break ;;
-              *) echo "[$TIMESTAMP] HALT: Unknown error."; break ;;
-            esac
-
-            if [ $ad_idx -ge ${#ADS[@]} ]; then ad_idx=0; shape_idx=$((shape_idx + 1)); fi
-            if [ $shape_idx -ge ${#SHAPES[@]} ]; then break; fi
-          done
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🏁 撤退報告 (Withdrawal Report)"
-          echo "  - 最終到達: ${LAST_SHAPE} in ${LAST_AD}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - run: echo "OK"
