@@ -12,20 +12,14 @@ jobs:
   request:
     runs-on: ubuntu-latest
     steps:
-      # 修正箇所：外部アクションを使わず、手動でインストールと設定を行う
       - name: Install and Configure OCI CLI
         run: |
-          # 1. OCI CLI のインストール
           pip install oci-cli
-
-          # 2. 設定ディレクトリの作成
           mkdir -p ~/.oci
-
-          # 3. 秘密鍵ファイルの作成
+          # 秘密鍵を書き出し
           echo "${{ secrets.OCI_CONFIG_KEY }}" > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
-
-          # 4. configファイルの作成
+          # 設定ファイル作成
           echo "[DEFAULT]" > ~/.oci/config
           echo "user=${{ secrets.OCI_CONFIG_USER }}" >> ~/.oci/config
           echo "fingerprint=${{ secrets.OCI_CONFIG_FINGERPRINT }}" >> ~/.oci/config
@@ -33,11 +27,29 @@ jobs:
           echo "region=ap-tokyo-1" >> ~/.oci/config
           echo "key_file=${HOME}/.oci/oci_api_key.pem" >> ~/.oci/config
 
-      - name: Execute State Machine
+      - name: Execute State Machine (Debug)
         run: |
-          set -euo pipefail
+          # クラッシュ防止：厳格モードをオフにする
+          set +e
           export TZ=Asia/Tokyo
+          export PATH=$PATH:$HOME/.local/bin
           
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔍 診断モード起動"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          # 1. 鍵ファイルの中身チェック（セキュリティのため先頭と末尾だけ表示）
+          echo "Checking Key Format..."
+          FIRST_LINE=$(head -n 1 ~/.oci/oci_api_key.pem)
+          LAST_LINE=$(tail -n 1 ~/.oci/oci_api_key.pem)
+          echo "  Header: $FIRST_LINE"
+          echo "  Footer: $LAST_LINE"
+          
+          if [[ "$FIRST_LINE" != *"BEGIN"* ]]; then
+             echo "⚠️ 警告: 秘密鍵の開始行がおかしいようです。"
+          fi
+
+          # 2. 状態機械ループ
           SHAPES=("VM.Standard.A1.Flex" "VM.Standard.E4.Flex")
           ADS=("Uocm:AP-TOKYO-1-AD-1" "Uocm:AP-TOKYO-1-AD-2" "Uocm:AP-TOKYO-1-AD-3")
           STACK_ID="${{ secrets.OCI_CONFIG_STACK_ID }}"
@@ -51,13 +63,21 @@ jobs:
             LAST_SHAPE="$CURRENT_SHAPE"; LAST_AD="$CURRENT_AD"
             TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
 
-            echo "[$TIMESTAMP] Start: $CURRENT_SHAPE in $CURRENT_AD (Retry: $retry_count)"
+            echo "[$TIMESTAMP] Start: $CURRENT_SHAPE in $CURRENT_AD"
 
-            set +e
-            # コマンド実行（設定ファイルはデフォルトの ~/.oci/config が使われます）
-            RESPONSE=$(oci resource-manager job create-apply-job --stack-id "$STACK_ID" --availability-domain "$CURRENT_AD" --shape "$CURRENT_SHAPE" 2>&1)
+            # コマンド実行結果をファイルに保存して解析（クラッシュ回避）
+            oci resource-manager job create-apply-job --stack-id "$STACK_ID" --availability-domain "$CURRENT_AD" --shape "$CURRENT_SHAPE" > response.log 2>&1
             EXIT_CODE=$?
-            set -e
+            RESPONSE=$(cat response.log)
+
+            # 致命的エラーの場合は即座に詳細を表示
+            if [ $EXIT_CODE -ne 0 ]; then
+               STATUS_CHECK=$(echo "$RESPONSE" | grep -o "ServiceError")
+               if [ -z "$STATUS_CHECK" ] && [[ "$RESPONSE" != *"ocid1.ormjob"* ]]; then
+                  echo "❌ OCI CLI ERROR details:"
+                  echo "$RESPONSE"
+               fi
+            fi
 
             if [ $EXIT_CODE -eq 0 ]; then
               JOB_ID=$(echo "$RESPONSE" | jq -r '.data.id // empty' 2>/dev/null)
@@ -67,7 +87,15 @@ jobs:
             STATUS=$(echo "$RESPONSE" | jq -r '.status // empty' 2>/dev/null)
             CODE=$(echo "$RESPONSE" | jq -r '.code // empty' 2>/dev/null)
             
-            if [ -z "$STATUS" ]; then STATUS="NON_JSON"; fi
+            if [ -z "$STATUS" ]; then 
+               STATUS="NON_JSON"
+               # デバッグ用：JSONじゃないエラー（設定ミスなど）ならループを抜ける
+               if [[ "$RESPONSE" == *"config"* ]] || [[ "$RESPONSE" == *"PEM"* ]]; then
+                  echo "[$TIMESTAMP] CONFIG ERROR: $RESPONSE"
+                  exit 1
+               fi
+            fi
+
             LOG_REPORT="${LOG_REPORT}  - ${CURRENT_SHAPE} / ${CURRENT_AD} : ${STATUS}:${CODE}\n"
 
             case "$STATUS:$CODE" in
