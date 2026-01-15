@@ -27,29 +27,12 @@ jobs:
           echo "region=ap-tokyo-1" >> ~/.oci/config
           echo "key_file=${HOME}/.oci/oci_api_key.pem" >> ~/.oci/config
 
-      - name: Execute State Machine (Debug)
+      - name: Execute State Machine
         run: |
-          # クラッシュ防止：厳格モードをオフにする
           set +e
           export TZ=Asia/Tokyo
-          export PATH=$PATH:$HOME/.local/bin
           
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🔍 診断モード起動"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          
-          # 1. 鍵ファイルの中身チェック（セキュリティのため先頭と末尾だけ表示）
-          echo "Checking Key Format..."
-          FIRST_LINE=$(head -n 1 ~/.oci/oci_api_key.pem)
-          LAST_LINE=$(tail -n 1 ~/.oci/oci_api_key.pem)
-          echo "  Header: $FIRST_LINE"
-          echo "  Footer: $LAST_LINE"
-          
-          if [[ "$FIRST_LINE" != *"BEGIN"* ]]; then
-             echo "⚠️ 警告: 秘密鍵の開始行がおかしいようです。"
-          fi
-
-          # 2. 状態機械ループ
+          # シェイプとADのリスト
           SHAPES=("VM.Standard.A1.Flex" "VM.Standard.E4.Flex")
           ADS=("Uocm:AP-TOKYO-1-AD-1" "Uocm:AP-TOKYO-1-AD-2" "Uocm:AP-TOKYO-1-AD-3")
           STACK_ID="${{ secrets.OCI_CONFIG_STACK_ID }}"
@@ -65,55 +48,12 @@ jobs:
 
             echo "[$TIMESTAMP] Start: $CURRENT_SHAPE in $CURRENT_AD"
 
-            # コマンド実行結果をファイルに保存して解析（クラッシュ回避）
-            oci resource-manager job create-apply-job --stack-id "$STACK_ID" --availability-domain "$CURRENT_AD" --shape "$CURRENT_SHAPE" > response.log 2>&1
-            EXIT_CODE=$?
-            RESPONSE=$(cat response.log)
+            # 修正箇所：変数をJSON形式で渡すように変更
+            # Terraformの変数名（instance_shape, availability_domain）に合わせています
+            VARIABLES_JSON="{\"instance_shape\": \"$CURRENT_SHAPE\", \"availability_domain\": \"$CURRENT_AD\"}"
 
-            # 致命的エラーの場合は即座に詳細を表示
-            if [ $EXIT_CODE -ne 0 ]; then
-               STATUS_CHECK=$(echo "$RESPONSE" | grep -o "ServiceError")
-               if [ -z "$STATUS_CHECK" ] && [[ "$RESPONSE" != *"ocid1.ormjob"* ]]; then
-                  echo "❌ OCI CLI ERROR details:"
-                  echo "$RESPONSE"
-               fi
-            fi
-
-            if [ $EXIT_CODE -eq 0 ]; then
-              JOB_ID=$(echo "$RESPONSE" | jq -r '.data.id // empty' 2>/dev/null)
-              echo "[$TIMESTAMP] SUCCESS: Instance provisioned (ID: $JOB_ID)"; exit 0
-            fi
-
-            STATUS=$(echo "$RESPONSE" | jq -r '.status // empty' 2>/dev/null)
-            CODE=$(echo "$RESPONSE" | jq -r '.code // empty' 2>/dev/null)
-            
-            if [ -z "$STATUS" ]; then 
-               STATUS="NON_JSON"
-               # デバッグ用：JSONじゃないエラー（設定ミスなど）ならループを抜ける
-               if [[ "$RESPONSE" == *"config"* ]] || [[ "$RESPONSE" == *"PEM"* ]]; then
-                  echo "[$TIMESTAMP] CONFIG ERROR: $RESPONSE"
-                  exit 1
-               fi
-            fi
-
-            LOG_REPORT="${LOG_REPORT}  - ${CURRENT_SHAPE} / ${CURRENT_AD} : ${STATUS}:${CODE}\n"
-
-            case "$STATUS:$CODE" in
-              401:*|403:*) echo "[$TIMESTAMP] ERROR: Auth issue."; exit 1 ;;
-              429:*) echo "[$TIMESTAMP] HALT: Rate limited."; break ;;
-              409:OutOfCapacity|409:LimitExceeded) ad_idx=$((ad_idx + 1)); retry_count=0 ;;
-              409:IncorrectState|5*:*|NON_JSON:*)
-                retry_count=$((retry_count + 1))
-                if [ $retry_count -gt $MAX_RETRY ]; then ad_idx=$((ad_idx + 1)); retry_count=0
-                else echo "[$TIMESTAMP] RETRY: Wait 30s..."; sleep 30; continue; fi ;;
-              409:Conflict) echo "[$TIMESTAMP] HALT: Stack Conflict."; break ;;
-              *) echo "[$TIMESTAMP] HALT: Unknown error."; break ;;
-            esac
-
-            if [ $ad_idx -ge ${#ADS[@]} ]; then ad_idx=0; shape_idx=$((shape_idx + 1)); fi
-            if [ $shape_idx -ge ${#SHAPES[@]} ]; then break; fi
-          done
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🏁 撤退報告 (Withdrawal Report)"
-          echo "  - 最終到達: ${LAST_SHAPE} in ${LAST_AD}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            # コマンド実行（自動承認モードを追加）
+            RESPONSE=$(oci resource-manager job create-apply-job \
+              --stack-id "$STACK_ID" \
+              --execution-plan-strategy "AUTO_APPROVED" \
+              --variables "$VARIABLES_JSON" 2>&1)
