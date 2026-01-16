@@ -1,7 +1,8 @@
 name: oci-instance-request-engine
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    # 1時間おきにリカバリー実行（生存確認）
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -11,10 +12,12 @@ concurrency:
 jobs:
   request:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
-      # 【修正】公式アクションを使わず、確実な手動インストールに戻しました
       - name: Install and Configure OCI CLI manually
         run: |
+          # 重要なセットアップはエラーで即死させる（set -e相当）
+          set -e
           pip install oci-cli
           mkdir -p ~/.oci
           echo "${{ secrets.OCI_CONFIG_KEY }}" > ~/.oci/oci_api_key.pem
@@ -25,44 +28,75 @@ jobs:
           echo "tenancy=${{ secrets.OCI_CONFIG_TENANCY }}" >> ~/.oci/config
           echo "region=ap-tokyo-1" >> ~/.oci/config
           echo "key_file=${HOME}/.oci/oci_api_key.pem" >> ~/.oci/config
+          
+          # 【改善】必須ツールの存在確認
+          command -v jq >/dev/null 2>&1 || { echo "❌ Critical: jq is not installed."; exit 1; }
+          command -v oci >/dev/null 2>&1 || { echo "❌ Critical: OCI CLI install failed."; exit 1; }
 
-      - name: Execute Provisioning Strategy
+      - name: Execute Tactical Strategy
         run: |
+          # アタックフェーズではエラーをハンドリングするため +e に戻す
           set +e
           export TZ=Asia/Tokyo
-          # 余計な警告を消して、JSON解析を邪魔させない
           export SUPPRESS_LABEL_WARNING=True
           export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
           
-          # 定数定義
           STACK_ID="${{ secrets.OCI_CONFIG_STACK_ID }}"
+          
+          # 戦術的優先順位（A1: AD-3優先, E4: AD-2優先）
           SHAPES=("VM.Standard.A1.Flex" "VM.Standard.E4.Flex")
-          ADS=("Uocm:AP-TOKYO-1-AD-1" "Uocm:AP-TOKYO-1-AD-2" "Uocm:AP-TOKYO-1-AD-3")
-          MAX_RETRY=2
+          declare -A AD_PRIORITY
+          AD_PRIORITY["VM.Standard.A1.Flex"]="Uocm:AP-TOKYO-1-AD-3 Uocm:AP-TOKYO-1-AD-2 Uocm:AP-TOKYO-1-AD-1"
+          AD_PRIORITY["VM.Standard.E4.Flex"]="Uocm:AP-TOKYO-1-AD-2 Uocm:AP-TOKYO-1-AD-3 Uocm:AP-TOKYO-1-AD-1"
 
+          RATE_LIMIT_WAIT=30
+          START_TIME=$(date +%s)
+          
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🚀 Provisioning Sequence Started (v3.1.0)"
+          echo "🏛️ OCI AUTO-PILOT v5.1.0 (Final Stable)"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-          # 3重ループ構造（Shape > AD > Retry）
-          for shape in "${SHAPES[@]}"; do
-            for ad in "${ADS[@]}"; do
-              
-              echo "🎯 Target: $shape in $ad"
-              
-              # パラメータファイルを生成
-              jq -n --arg shape "$shape" --arg ad "$ad" \
-                '{"instance_shape": $shape, "availability_domain": $ad}' > params.json
+          while true; do
+            # 【Graceful Shutdown】残り2分で自発的終了
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            REMAINING=$((21600 - ELAPSED))
+            
+            if [ $REMAINING -lt 120 ]; then
+              echo "🛑 Maintenance: Exiting gracefully to rotate runners."
+              exit 0
+            fi
 
-              # リトライループ
-              for (( i=1; i<=MAX_RETRY; i++ )); do
-                TIMESTAMP=$(date "+%H:%M:%S")
+            for shape in "${SHAPES[@]}"; do
+              read -r -a CURRENT_ADS <<< "${AD_PRIORITY[$shape]}"
+              
+              for ad in "${CURRENT_ADS[@]}"; do
                 
-                # ジョブ実行
+                # 【安全装置】重複実行ガード
+                RUNNING_JOB=$(oci resource-manager job list \
+                  --stack-id "$STACK_ID" \
+                  --lifecycle-state IN_PROGRESS \
+                  --query 'data[0].id' \
+                  --raw-output 2>/dev/null)
+
+                if [ -n "$RUNNING_JOB" ] && [ "$RUNNING_JOB" != "null" ]; then
+                  TIMESTAMP=$(date "+%H:%M:%S")
+                  echo "⏸️ [${TIMESTAMP}] Job active ($RUNNING_JOB). Standby..."
+                  sleep 30
+                  continue
+                fi
+
+                TIMESTAMP=$(date "+%H:%M:%S")
+                echo "⚔️ [${TIMESTAMP}] Target: $shape @ $ad"
+                
+                # オンメモリ変数展開
+                PARAMS=$(jq -n --arg shape "$shape" --arg ad "$ad" \
+                  '{"instance_shape": $shape, "availability_domain": $ad}')
+
                 RESPONSE=$(oci resource-manager job create-apply-job \
                   --stack-id "$STACK_ID" \
                   --execution-plan-strategy "AUTO_APPROVED" \
-                  --variables file://params.json 2>&1)
+                  --variables "$PARAMS" 2>&1)
                 
                 EXIT_CODE=$?
 
@@ -70,56 +104,50 @@ jobs:
                 if [ $EXIT_CODE -eq 0 ]; then
                   JOB_ID=$(echo "$RESPONSE" | jq -r '.data.id // empty' 2>/dev/null)
                   if [ -n "$JOB_ID" ]; then
-                    echo "[$TIMESTAMP] ✅ SUCCESS: Job created successfully! (ID: $JOB_ID)"
+                    echo "🎉 SUCCESS: Provisioning started! Job ID: $JOB_ID"
+                    
+                    # 【改善】GitHub Summaryに勝利報告を書き込む
+                    echo "## 🚀 Oracle Cloud Server Secured!" >> $GITHUB_STEP_SUMMARY
+                    echo "**Shape**: $shape" >> $GITHUB_STEP_SUMMARY
+                    echo "**AD**: $ad" >> $GITHUB_STEP_SUMMARY
+                    echo "**Job ID**: $JOB_ID" >> $GITHUB_STEP_SUMMARY
+                    echo "Check your OCI Console immediately." >> $GITHUB_STEP_SUMMARY
+                    
                     exit 0
                   fi
                 fi
 
-                # エラー解析
-                HTTP_STATUS=$(echo "$RESPONSE" | jq -r '.status // "000"' 2>/dev/null)
+                # エラー解析 & 指数バックオフ
                 ERROR_CODE=$(echo "$RESPONSE" | jq -r '.code // "Unknown"' 2>/dev/null)
                 
-                # JSONパース失敗時のフォールバック
                 if [ "$ERROR_CODE" == "Unknown" ] || [ "$ERROR_CODE" == "null" ]; then
                    if [[ "$RESPONSE" == *"429"* ]] || [[ "$RESPONSE" == *"TooManyRequests"* ]]; then ERROR_CODE="TooManyRequests"; fi
                    if [[ "$RESPONSE" == *"401"* ]] || [[ "$RESPONSE" == *"NotAuthenticated"* ]]; then ERROR_CODE="NotAuthenticated"; fi
                    if [[ "$RESPONSE" == *"Out of host capacity"* ]]; then ERROR_CODE="OutOfCapacity"; fi
                 fi
 
-                echo "   Attempt $i/$MAX_RETRY: [$HTTP_STATUS] $ERROR_CODE"
-
-                # 戦略分岐
                 case "$ERROR_CODE" in
                   NotAuthenticated|401)
-                    echo "❌ Critical Error: Authentication failed."
-                    echo "$RESPONSE"
-                    exit 1
-                    ;;
+                    echo "❌ Critical: Authentication failed. Check Secrets."
+                    exit 1 ;;
                   TooManyRequests|429)
-                    echo "⚠️ Rate Limited. Cooling down..."
-                    sleep 60
-                    continue
+                    echo "⚠️ Rate Limit. Sleep ${RATE_LIMIT_WAIT}s..."
+                    sleep $RATE_LIMIT_WAIT
+                    RATE_LIMIT_WAIT=$((RATE_LIMIT_WAIT * 2))
+                    if [ $RATE_LIMIT_WAIT -gt 300 ]; then RATE_LIMIT_WAIT=300; fi
                     ;;
                   OutOfCapacity|LimitExceeded)
-                    echo "📉 Out of Capacity. Moving to next target."
-                    break 1 
-                    ;;
-                  IncorrectState|Conflict)
-                    if [ $i -lt $MAX_RETRY ]; then
-                      echo "🔄 State Conflict. Retrying in 30s..."
-                      sleep 30
-                    fi
+                    echo "📉 Full. Next."
+                    RATE_LIMIT_WAIT=30
                     ;;
                   *)
-                    echo "⚠️ Unknown Error or Wait."
-                    if [ $i -lt $MAX_RETRY ]; then sleep 30; fi
+                    echo "⚠️ Status: $ERROR_CODE"
+                    sleep 10
                     ;;
                 esac
-              done # Retry Loop
-            done # AD Loop
-          done # Shape Loop
-
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🏁 All attempts finished without success."
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          exit 0
+                
+                sleep 10
+              done
+            done
+            sleep 5
+          done
