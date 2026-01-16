@@ -12,21 +12,27 @@ jobs:
   request:
     runs-on: ubuntu-latest
     steps:
-      # 【改善】pip installをやめ、公式アクションで安定化と高速化を図る
-      - name: Setup OCI CLI
-        uses: oracle-actions/setup-oci-cli@v1.1.1
-        with:
-          user: ${{ secrets.OCI_CONFIG_USER }}
-          fingerprint: ${{ secrets.OCI_CONFIG_FINGERPRINT }}
-          tenancy: ${{ secrets.OCI_CONFIG_TENANCY }}
-          region: "ap-tokyo-1"
-          api_key: ${{ secrets.OCI_CONFIG_KEY }}
+      # 【修正】公式アクションを使わず、確実な手動インストールに戻しました
+      - name: Install and Configure OCI CLI manually
+        run: |
+          pip install oci-cli
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_CONFIG_KEY }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          echo "[DEFAULT]" > ~/.oci/config
+          echo "user=${{ secrets.OCI_CONFIG_USER }}" >> ~/.oci/config
+          echo "fingerprint=${{ secrets.OCI_CONFIG_FINGERPRINT }}" >> ~/.oci/config
+          echo "tenancy=${{ secrets.OCI_CONFIG_TENANCY }}" >> ~/.oci/config
+          echo "region=ap-tokyo-1" >> ~/.oci/config
+          echo "key_file=${HOME}/.oci/oci_api_key.pem" >> ~/.oci/config
 
       - name: Execute Provisioning Strategy
         run: |
-          # エラーで即停止せず、ハンドリングを自前で行う
           set +e
           export TZ=Asia/Tokyo
+          # 余計な警告を消して、JSON解析を邪魔させない
+          export SUPPRESS_LABEL_WARNING=True
+          export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
           
           # 定数定義
           STACK_ID="${{ secrets.OCI_CONFIG_STACK_ID }}"
@@ -35,17 +41,16 @@ jobs:
           MAX_RETRY=2
 
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🚀 Provisioning Sequence Started"
+          echo "🚀 Provisioning Sequence Started (v3.1.0)"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-          # 【構造改革】無限ループを廃止し、予測可能な3重ループへ変更
+          # 3重ループ構造（Shape > AD > Retry）
           for shape in "${SHAPES[@]}"; do
             for ad in "${ADS[@]}"; do
               
               echo "🎯 Target: $shape in $ad"
               
-              # 【安全性】Stack Updateを廃止。変数はファイル経由でジョブに直接注入する
-              # これによりスタック本体のロック(IncorrectState)を回避
+              # パラメータファイルを生成
               jq -n --arg shape "$shape" --arg ad "$ad" \
                 '{"instance_shape": $shape, "availability_domain": $ad}' > params.json
 
@@ -53,7 +58,7 @@ jobs:
               for (( i=1; i<=MAX_RETRY; i++ )); do
                 TIMESTAMP=$(date "+%H:%M:%S")
                 
-                # ジョブ実行（変数を注入しながらApply）
+                # ジョブ実行
                 RESPONSE=$(oci resource-manager job create-apply-job \
                   --stack-id "$STACK_ID" \
                   --execution-plan-strategy "AUTO_APPROVED" \
@@ -61,12 +66,11 @@ jobs:
                 
                 EXIT_CODE=$?
 
-                # 【堅牢化】JSONパースによる厳密なステータス判定
+                # 成功判定
                 if [ $EXIT_CODE -eq 0 ]; then
-                  JOB_ID=$(echo "$RESPONSE" | jq -r '.data.id // empty')
+                  JOB_ID=$(echo "$RESPONSE" | jq -r '.data.id // empty' 2>/dev/null)
                   if [ -n "$JOB_ID" ]; then
                     echo "[$TIMESTAMP] ✅ SUCCESS: Job created successfully! (ID: $JOB_ID)"
-                    # 成功したら全ループを抜けて終了
                     exit 0
                   fi
                 fi
@@ -75,8 +79,8 @@ jobs:
                 HTTP_STATUS=$(echo "$RESPONSE" | jq -r '.status // "000"' 2>/dev/null)
                 ERROR_CODE=$(echo "$RESPONSE" | jq -r '.code // "Unknown"' 2>/dev/null)
                 
-                # JSONパース失敗時のフォールバック（CLIが生テキストを吐いた場合）
-                if [ "$ERROR_CODE" == "Unknown" ]; then
+                # JSONパース失敗時のフォールバック
+                if [ "$ERROR_CODE" == "Unknown" ] || [ "$ERROR_CODE" == "null" ]; then
                    if [[ "$RESPONSE" == *"429"* ]] || [[ "$RESPONSE" == *"TooManyRequests"* ]]; then ERROR_CODE="TooManyRequests"; fi
                    if [[ "$RESPONSE" == *"401"* ]] || [[ "$RESPONSE" == *"NotAuthenticated"* ]]; then ERROR_CODE="NotAuthenticated"; fi
                    if [[ "$RESPONSE" == *"Out of host capacity"* ]]; then ERROR_CODE="OutOfCapacity"; fi
@@ -84,39 +88,30 @@ jobs:
 
                 echo "   Attempt $i/$MAX_RETRY: [$HTTP_STATUS] $ERROR_CODE"
 
-                # 【戦略分岐】ステータスコードに基づく判断
+                # 戦略分岐
                 case "$ERROR_CODE" in
-                  # 認証エラー：これ以上やっても無駄なので即死させる
                   NotAuthenticated|401)
                     echo "❌ Critical Error: Authentication failed."
                     echo "$RESPONSE"
                     exit 1
                     ;;
-                  
-                  # レート制限：少し待ってリトライ（ループは継続）
                   TooManyRequests|429)
                     echo "⚠️ Rate Limited. Cooling down..."
                     sleep 60
                     continue
                     ;;
-                  
-                  # 容量不足：このAD/Shapeは諦めて次のADへ（breakして内側ループを抜ける）
                   OutOfCapacity|LimitExceeded)
                     echo "📉 Out of Capacity. Moving to next target."
                     break 1 
                     ;;
-                  
-                  # スタック競合・状態不正：一時的なものなのでリトライ
                   IncorrectState|Conflict)
                     if [ $i -lt $MAX_RETRY ]; then
                       echo "🔄 State Conflict. Retrying in 30s..."
                       sleep 30
                     fi
                     ;;
-                    
-                  # その他不明なエラー：詳細を出してリトライ
                   *)
-                    echo "⚠️ Unknown Error occurred."
+                    echo "⚠️ Unknown Error or Wait."
                     if [ $i -lt $MAX_RETRY ]; then sleep 30; fi
                     ;;
                 esac
