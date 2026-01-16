@@ -1,7 +1,6 @@
 name: oci-instance-request-engine
 on:
   schedule:
-    # 1時間おきにリカバリー実行（生存確認）
     - cron: '0 * * * *'
   workflow_dispatch:
 
@@ -16,12 +15,13 @@ jobs:
     steps:
       - name: Install and Configure OCI CLI manually
         run: |
-          # 重要なセットアップはエラーで即死させる（set -e相当）
           set -e
-          pip install oci-cli
+          # 【修正1】umaskで権限を最初から絞る
+          (umask 077; echo "${{ secrets.OCI_CONFIG_KEY }}" > oci_api_key.pem)
+          
           mkdir -p ~/.oci
-          echo "${{ secrets.OCI_CONFIG_KEY }}" > ~/.oci/oci_api_key.pem
-          chmod 600 ~/.oci/oci_api_key.pem
+          mv oci_api_key.pem ~/.oci/
+          
           echo "[DEFAULT]" > ~/.oci/config
           echo "user=${{ secrets.OCI_CONFIG_USER }}" >> ~/.oci/config
           echo "fingerprint=${{ secrets.OCI_CONFIG_FINGERPRINT }}" >> ~/.oci/config
@@ -29,13 +29,13 @@ jobs:
           echo "region=ap-tokyo-1" >> ~/.oci/config
           echo "key_file=${HOME}/.oci/oci_api_key.pem" >> ~/.oci/config
           
-          # 【改善】必須ツールの存在確認
+          pip install oci-cli
+          
           command -v jq >/dev/null 2>&1 || { echo "❌ Critical: jq is not installed."; exit 1; }
           command -v oci >/dev/null 2>&1 || { echo "❌ Critical: OCI CLI install failed."; exit 1; }
 
       - name: Execute Tactical Strategy
         run: |
-          # アタックフェーズではエラーをハンドリングするため +e に戻す
           set +e
           export TZ=Asia/Tokyo
           export SUPPRESS_LABEL_WARNING=True
@@ -43,7 +43,6 @@ jobs:
           
           STACK_ID="${{ secrets.OCI_CONFIG_STACK_ID }}"
           
-          # 戦術的優先順位（A1: AD-3優先, E4: AD-2優先）
           SHAPES=("VM.Standard.A1.Flex" "VM.Standard.E4.Flex")
           declare -A AD_PRIORITY
           AD_PRIORITY["VM.Standard.A1.Flex"]="Uocm:AP-TOKYO-1-AD-3 Uocm:AP-TOKYO-1-AD-2 Uocm:AP-TOKYO-1-AD-1"
@@ -53,17 +52,16 @@ jobs:
           START_TIME=$(date +%s)
           
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🏛️ OCI AUTO-PILOT v5.1.0 (Final Stable)"
+          echo "🛡️ OCI AUTO-PILOT v5.2.0 (Refined & Secure)"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
           while true; do
-            # 【Graceful Shutdown】残り2分で自発的終了
             CURRENT_TIME=$(date +%s)
             ELAPSED=$((CURRENT_TIME - START_TIME))
             REMAINING=$((21600 - ELAPSED))
             
             if [ $REMAINING -lt 120 ]; then
-              echo "🛑 Maintenance: Exiting gracefully to rotate runners."
+              echo "🛑 Maintenance: Exiting gracefully."
               exit 0
             fi
 
@@ -72,7 +70,7 @@ jobs:
               
               for ad in "${CURRENT_ADS[@]}"; do
                 
-                # 【安全装置】重複実行ガード
+                # Check for running jobs
                 RUNNING_JOB=$(oci resource-manager job list \
                   --stack-id "$STACK_ID" \
                   --lifecycle-state IN_PROGRESS \
@@ -89,35 +87,29 @@ jobs:
                 TIMESTAMP=$(date "+%H:%M:%S")
                 echo "⚔️ [${TIMESTAMP}] Target: $shape @ $ad"
                 
-                # オンメモリ変数展開
-                PARAMS=$(jq -n --arg shape "$shape" --arg ad "$ad" \
-                  '{"instance_shape": $shape, "availability_domain": $ad}')
+                # 【修正2】JSONをファイルに書き出し、CLIにはファイルパスを渡す
+                jq -n --arg shape "$shape" --arg ad "$ad" \
+                  '{"instance_shape": $shape, "availability_domain": $ad}' > params.json
 
                 RESPONSE=$(oci resource-manager job create-apply-job \
                   --stack-id "$STACK_ID" \
                   --execution-plan-strategy "AUTO_APPROVED" \
-                  --variables "$PARAMS" 2>&1)
+                  --variables file://params.json 2>&1)
                 
                 EXIT_CODE=$?
 
-                # 成功判定
                 if [ $EXIT_CODE -eq 0 ]; then
                   JOB_ID=$(echo "$RESPONSE" | jq -r '.data.id // empty' 2>/dev/null)
                   if [ -n "$JOB_ID" ]; then
                     echo "🎉 SUCCESS: Provisioning started! Job ID: $JOB_ID"
-                    
-                    # 【改善】GitHub Summaryに勝利報告を書き込む
                     echo "## 🚀 Oracle Cloud Server Secured!" >> $GITHUB_STEP_SUMMARY
                     echo "**Shape**: $shape" >> $GITHUB_STEP_SUMMARY
                     echo "**AD**: $ad" >> $GITHUB_STEP_SUMMARY
                     echo "**Job ID**: $JOB_ID" >> $GITHUB_STEP_SUMMARY
-                    echo "Check your OCI Console immediately." >> $GITHUB_STEP_SUMMARY
-                    
                     exit 0
                   fi
                 fi
 
-                # エラー解析 & 指数バックオフ
                 ERROR_CODE=$(echo "$RESPONSE" | jq -r '.code // "Unknown"' 2>/dev/null)
                 
                 if [ "$ERROR_CODE" == "Unknown" ] || [ "$ERROR_CODE" == "null" ]; then
@@ -128,7 +120,7 @@ jobs:
 
                 case "$ERROR_CODE" in
                   NotAuthenticated|401)
-                    echo "❌ Critical: Authentication failed. Check Secrets."
+                    echo "❌ Critical: Authentication failed."
                     exit 1 ;;
                   TooManyRequests|429)
                     echo "⚠️ Rate Limit. Sleep ${RATE_LIMIT_WAIT}s..."
@@ -142,12 +134,12 @@ jobs:
                     ;;
                   *)
                     echo "⚠️ Status: $ERROR_CODE"
-                    sleep 10
+                    sleep 5 # 【修正3】通常エラー時のWaitを短縮
                     ;;
                 esac
                 
-                sleep 10
+                sleep 5 
               done
             done
-            sleep 5
+            sleep 1
           done
