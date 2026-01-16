@@ -12,92 +12,119 @@ jobs:
   request:
     runs-on: ubuntu-latest
     steps:
-      - name: Install and Configure OCI CLI
-        run: |
-          pip install oci-cli
-          mkdir -p ~/.oci
-          echo "${{ secrets.OCI_CONFIG_KEY }}" > ~/.oci/oci_api_key.pem
-          chmod 600 ~/.oci/oci_api_key.pem
-          echo "[DEFAULT]" > ~/.oci/config
-          echo "user=${{ secrets.OCI_CONFIG_USER }}" >> ~/.oci/config
-          echo "fingerprint=${{ secrets.OCI_CONFIG_FINGERPRINT }}" >> ~/.oci/config
-          echo "tenancy=${{ secrets.OCI_CONFIG_TENANCY }}" >> ~/.oci/config
-          echo "region=ap-tokyo-1" >> ~/.oci/config
-          echo "key_file=${HOME}/.oci/oci_api_key.pem" >> ~/.oci/config
+      # 【改善】pip installをやめ、公式アクションで安定化と高速化を図る
+      - name: Setup OCI CLI
+        uses: oracle-actions/setup-oci-cli@v1.1.1
+        with:
+          user: ${{ secrets.OCI_CONFIG_USER }}
+          fingerprint: ${{ secrets.OCI_CONFIG_FINGERPRINT }}
+          tenancy: ${{ secrets.OCI_CONFIG_TENANCY }}
+          region: "ap-tokyo-1"
+          api_key: ${{ secrets.OCI_CONFIG_KEY }}
 
-      - name: Execute State Machine
+      - name: Execute Provisioning Strategy
         run: |
+          # エラーで即停止せず、ハンドリングを自前で行う
           set +e
           export TZ=Asia/Tokyo
           
+          # 定数定義
+          STACK_ID="${{ secrets.OCI_CONFIG_STACK_ID }}"
           SHAPES=("VM.Standard.A1.Flex" "VM.Standard.E4.Flex")
           ADS=("Uocm:AP-TOKYO-1-AD-1" "Uocm:AP-TOKYO-1-AD-2" "Uocm:AP-TOKYO-1-AD-3")
-          STACK_ID="${{ secrets.OCI_CONFIG_STACK_ID }}"
-          
-          shape_idx=0; ad_idx=0; retry_count=0; MAX_RETRY=2
-          LOG_REPORT=""; LAST_SHAPE=""; LAST_AD=""
+          MAX_RETRY=2
 
-          while true; do
-            CURRENT_SHAPE="${SHAPES[$shape_idx]}"
-            CURRENT_AD="${ADS[$ad_idx]}"
-            LAST_SHAPE="$CURRENT_SHAPE"; LAST_AD="$CURRENT_AD"
-            TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
-
-            echo "[$TIMESTAMP] Start: $CURRENT_SHAPE in $CURRENT_AD"
-
-            # 修正：JSONの引用符トラブルを避けるため、ファイル経由で渡す
-            echo "{\"instance_shape\": \"$CURRENT_SHAPE\", \"availability_domain\": \"$CURRENT_AD\"}" > params.json
-
-            RESPONSE=$(oci resource-manager job create-apply-job \
-              --stack-id "$STACK_ID" \
-              --execution-plan-strategy "AUTO_APPROVED" \
-              --variables file://params.json 2>&1)
-            
-            EXIT_CODE=$?
-
-            if [ $EXIT_CODE -eq 0 ]; then
-              JOB_ID=$(echo "$RESPONSE" | jq -r '.data.id // empty' 2>/dev/null)
-              if [ ! -z "$JOB_ID" ]; then
-                 echo "[$TIMESTAMP] SUCCESS: Instance provisioned (Job ID: $JOB_ID)"; exit 0
-              fi
-            fi
-
-            STATUS=$(echo "$RESPONSE" | grep -o "ServiceError" || echo "")
-            
-            if [[ "$RESPONSE" == *"401"* ]] || [[ "$RESPONSE" == *"403"* ]]; then
-               echo "[$TIMESTAMP] ERROR: Auth issue details below:"
-               echo "$RESPONSE"
-               exit 1
-            fi
-
-            if [[ "$RESPONSE" == *"Out of host capacity"* ]] || [[ "$RESPONSE" == *"LimitExceeded"* ]]; then
-               CODE="OutOfCapacity"
-            elif [[ "$RESPONSE" == *"TooManyRequests"* ]] || [[ "$RESPONSE" == *"429"* ]]; then
-               CODE="RateLimit"
-            elif [[ "$RESPONSE" == *"IncorrectState"* ]]; then
-               CODE="IncorrectState"
-            else
-               CODE="UnknownError"
-               SHORT_ERR=$(echo "$RESPONSE" | head -n 3)
-            fi
-            
-            LOG_REPORT="${LOG_REPORT}  - ${CURRENT_SHAPE} / ${CURRENT_AD} : ${CODE} : ${SHORT_ERR}\n"
-
-            case "$CODE" in
-              RateLimit) echo "[$TIMESTAMP] HALT: Rate limited."; break ;;
-              OutOfCapacity) ad_idx=$((ad_idx + 1)); retry_count=0 ;;
-              IncorrectState|UnknownError)
-                retry_count=$((retry_count + 1))
-                if [ $retry_count -gt $MAX_RETRY ]; then ad_idx=$((ad_idx + 1)); retry_count=0
-                else echo "[$TIMESTAMP] RETRY: Wait 30s..."; sleep 30; continue; fi ;;
-              *) echo "[$TIMESTAMP] HALT: Fatal error."; break ;;
-            esac
-
-            if [ $ad_idx -ge ${#ADS[@]} ]; then ad_idx=0; shape_idx=$((shape_idx + 1)); fi
-            if [ $shape_idx -ge ${#SHAPES[@]} ]; then break; fi
-          done
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🏁 撤退報告 (Withdrawal Report)"
-          echo -e "$LOG_REPORT"
-          echo "  - 最終到達: ${LAST_SHAPE} in ${LAST_AD}"
+          echo "🚀 Provisioning Sequence Started"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # 【構造改革】無限ループを廃止し、予測可能な3重ループへ変更
+          for shape in "${SHAPES[@]}"; do
+            for ad in "${ADS[@]}"; do
+              
+              echo "🎯 Target: $shape in $ad"
+              
+              # 【安全性】Stack Updateを廃止。変数はファイル経由でジョブに直接注入する
+              # これによりスタック本体のロック(IncorrectState)を回避
+              jq -n --arg shape "$shape" --arg ad "$ad" \
+                '{"instance_shape": $shape, "availability_domain": $ad}' > params.json
+
+              # リトライループ
+              for (( i=1; i<=MAX_RETRY; i++ )); do
+                TIMESTAMP=$(date "+%H:%M:%S")
+                
+                # ジョブ実行（変数を注入しながらApply）
+                RESPONSE=$(oci resource-manager job create-apply-job \
+                  --stack-id "$STACK_ID" \
+                  --execution-plan-strategy "AUTO_APPROVED" \
+                  --variables file://params.json 2>&1)
+                
+                EXIT_CODE=$?
+
+                # 【堅牢化】JSONパースによる厳密なステータス判定
+                if [ $EXIT_CODE -eq 0 ]; then
+                  JOB_ID=$(echo "$RESPONSE" | jq -r '.data.id // empty')
+                  if [ -n "$JOB_ID" ]; then
+                    echo "[$TIMESTAMP] ✅ SUCCESS: Job created successfully! (ID: $JOB_ID)"
+                    # 成功したら全ループを抜けて終了
+                    exit 0
+                  fi
+                fi
+
+                # エラー解析
+                HTTP_STATUS=$(echo "$RESPONSE" | jq -r '.status // "000"' 2>/dev/null)
+                ERROR_CODE=$(echo "$RESPONSE" | jq -r '.code // "Unknown"' 2>/dev/null)
+                
+                # JSONパース失敗時のフォールバック（CLIが生テキストを吐いた場合）
+                if [ "$ERROR_CODE" == "Unknown" ]; then
+                   if [[ "$RESPONSE" == *"429"* ]] || [[ "$RESPONSE" == *"TooManyRequests"* ]]; then ERROR_CODE="TooManyRequests"; fi
+                   if [[ "$RESPONSE" == *"401"* ]] || [[ "$RESPONSE" == *"NotAuthenticated"* ]]; then ERROR_CODE="NotAuthenticated"; fi
+                   if [[ "$RESPONSE" == *"Out of host capacity"* ]]; then ERROR_CODE="OutOfCapacity"; fi
+                fi
+
+                echo "   Attempt $i/$MAX_RETRY: [$HTTP_STATUS] $ERROR_CODE"
+
+                # 【戦略分岐】ステータスコードに基づく判断
+                case "$ERROR_CODE" in
+                  # 認証エラー：これ以上やっても無駄なので即死させる
+                  NotAuthenticated|401)
+                    echo "❌ Critical Error: Authentication failed."
+                    echo "$RESPONSE"
+                    exit 1
+                    ;;
+                  
+                  # レート制限：少し待ってリトライ（ループは継続）
+                  TooManyRequests|429)
+                    echo "⚠️ Rate Limited. Cooling down..."
+                    sleep 60
+                    continue
+                    ;;
+                  
+                  # 容量不足：このAD/Shapeは諦めて次のADへ（breakして内側ループを抜ける）
+                  OutOfCapacity|LimitExceeded)
+                    echo "📉 Out of Capacity. Moving to next target."
+                    break 1 
+                    ;;
+                  
+                  # スタック競合・状態不正：一時的なものなのでリトライ
+                  IncorrectState|Conflict)
+                    if [ $i -lt $MAX_RETRY ]; then
+                      echo "🔄 State Conflict. Retrying in 30s..."
+                      sleep 30
+                    fi
+                    ;;
+                    
+                  # その他不明なエラー：詳細を出してリトライ
+                  *)
+                    echo "⚠️ Unknown Error occurred."
+                    if [ $i -lt $MAX_RETRY ]; then sleep 30; fi
+                    ;;
+                esac
+              done # Retry Loop
+            done # AD Loop
+          done # Shape Loop
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🏁 All attempts finished without success."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          exit 0
