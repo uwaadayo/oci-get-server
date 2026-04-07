@@ -16,7 +16,6 @@ jobs:
       - name: Install and Configure OCI CLI manually
         run: |
           set -e
-          # 【修正1】umaskで権限を最初から絞る
           (umask 077; echo "${{ secrets.OCI_CONFIG_KEY }}" > oci_api_key.pem)
           
           mkdir -p ~/.oci
@@ -52,7 +51,7 @@ jobs:
           START_TIME=$(date +%s)
           
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🛡️ OCI AUTO-PILOT v5.2.0 (Refined & Secure)"
+          echo "🛡️ OCI AUTO-PILOT v5.3.0 (True Watcher)"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
           while true; do
@@ -70,7 +69,6 @@ jobs:
               
               for ad in "${CURRENT_ADS[@]}"; do
                 
-                # Check for running jobs
                 RUNNING_JOB=$(oci resource-manager job list \
                   --stack-id "$STACK_ID" \
                   --lifecycle-state IN_PROGRESS \
@@ -87,7 +85,6 @@ jobs:
                 TIMESTAMP=$(date "+%H:%M:%S")
                 echo "⚔️ [${TIMESTAMP}] Target: $shape @ $ad"
                 
-                # 【修正2】JSONをファイルに書き出し、CLIにはファイルパスを渡す
                 jq -n --arg shape "$shape" --arg ad "$ad" \
                   '{"instance_shape": $shape, "availability_domain": $ad}' > params.json
 
@@ -101,12 +98,33 @@ jobs:
                 if [ $EXIT_CODE -eq 0 ]; then
                   JOB_ID=$(echo "$RESPONSE" | jq -r '.data.id // empty' 2>/dev/null)
                   if [ -n "$JOB_ID" ]; then
-                    echo "🎉 SUCCESS: Provisioning started! Job ID: $JOB_ID"
-                    echo "## 🚀 Oracle Cloud Server Secured!" >> $GITHUB_STEP_SUMMARY
-                    echo "**Shape**: $shape" >> $GITHUB_STEP_SUMMARY
-                    echo "**AD**: $ad" >> $GITHUB_STEP_SUMMARY
-                    echo "**Job ID**: $JOB_ID" >> $GITHUB_STEP_SUMMARY
-                    exit 0
+                    echo "📝 注文受付完了 ($JOB_ID). サーバーの完成を待機します..."
+                    
+                    # 【v5.3.0 追加機能】サーバーが本当に建つまで監視する
+                    while true; do
+                      JOB_INFO=$(oci resource-manager job get --job-id "$JOB_ID" 2>/dev/null)
+                      JOB_STATE=$(echo "$JOB_INFO" | jq -r '.data["lifecycle-state"] // "UNKNOWN"')
+                      
+                      if [ "$JOB_STATE" == "SUCCEEDED" ]; then
+                        echo "🎉 SUCCESS: サーバーの確保に完全成功しました！"
+                        echo "## 🚀 Oracle Cloud Server Secured!" >> $GITHUB_STEP_SUMMARY
+                        echo "**Shape**: $shape" >> $GITHUB_STEP_SUMMARY
+                        echo "**AD**: $ad" >> $GITHUB_STEP_SUMMARY
+                        echo "**Job ID**: $JOB_ID" >> $GITHUB_STEP_SUMMARY
+                        exit 0
+                      elif [ "$JOB_STATE" == "FAILED" ]; then
+                        echo "⚠️ Terraform Error: 在庫不足のため失敗。アタックを継続します。"
+                        break # ループを抜けて次のADへ進む
+                      elif [ "$JOB_STATE" == "UNKNOWN" ]; then
+                        echo "⚠️ 状態取得エラー。リトライします..."
+                      else
+                        echo "⏳ 構築中ステータス: $JOB_STATE ..."
+                      fi
+                      sleep 10
+                    done
+                    
+                    # FAILEDで抜けた場合は、continueしてアタックを止めない
+                    continue
                   fi
                 fi
 
@@ -134,7 +152,7 @@ jobs:
                     ;;
                   *)
                     echo "⚠️ Status: $ERROR_CODE"
-                    sleep 5 # 【修正3】通常エラー時のWaitを短縮
+                    sleep 5
                     ;;
                 esac
                 
